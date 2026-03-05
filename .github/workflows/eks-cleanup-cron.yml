@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────
+#  EKS Cleanup Cron  –  runs every 30 min until cluster is deleted
+# ─────────────────────────────────────────────────────────────────
+# How it works:
+#   • Scheduled every 30 minutes via cron.
+#   • Runs main.py which checks if the cluster is idle for 1.5 hrs.
+#     - Exit 0  → cleanup succeeded   → workflow disables itself.
+#     - Exit 1  → cluster not found   → workflow disables itself.
+#     - Exit 2  → cluster still in use → do nothing, retry next run.
+#   • Can also be triggered manually via workflow_dispatch.
+# ─────────────────────────────────────────────────────────────────
+
+name: EKS Cleanup Cron
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"    # every 30 minutes
+  workflow_dispatch:            # allow manual trigger
+
+env:
+  CLUSTER_NAME: eksdemo
+  AWS_REGION: us-east-1
+
+permissions:
+  actions: write              # needed to disable this workflow after cleanup
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Checkout code ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Python ──
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 3. Install dependencies ──
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Install kubectl ──
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # ── 5. Configure AWS credentials ──
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      # ── 6. Run cleanup script ──
+      - name: Run EKS cleanup
+        id: cleanup
+        run: |
+          set +e
+          python main.py --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION"
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "result=DELETED" >> "$GITHUB_OUTPUT"
+            echo "✅ Cluster deleted successfully!"
+          elif [ $EXIT_CODE -eq 1 ]; then
+            echo "result=NOT_FOUND" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  Cluster not found – already deleted or wrong name."
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "result=IN_USE" >> "$GITHUB_OUTPUT"
+            echo "⏳ Cluster still in use – will retry in 30 minutes."
+          else
+            echo "result=ERROR" >> "$GITHUB_OUTPUT"
+            echo "❌ Unexpected error (exit code $EXIT_CODE)."
+          fi
+          exit 0   # always succeed so the disable step can run
+
+      # ── 7. Disable this workflow after successful cleanup ──
+      - name: Disable workflow (cleanup done)
+        if: steps.cleanup.outputs.result == 'DELETED' || steps.cleanup.outputs.result == 'NOT_FOUND'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const result = "${{ steps.cleanup.outputs.result }}";
+            console.log(`Cleanup result: ${result}`);
+            console.log("Disabling this workflow so it stops running…");
+
+            // Get this workflow's ID
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const thisWorkflow = workflows.data.workflows.find(
+              w => w.name === "EKS Cleanup Cron"
+            );
+
+            if (thisWorkflow) {
+              // Disable the workflow
+              await github.rest.actions.disableWorkflow({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: thisWorkflow.id,
+              });
+              console.log(`✅ Workflow "${thisWorkflow.name}" (ID: ${thisWorkflow.id}) has been DISABLED.`);
+              console.log("No more scheduled runs will occur.");
+            } else {
+              console.log("⚠️ Could not find this workflow to disable it.");
+            }
+
+      # ── 8. Summary ──
+      - name: Job summary
+        run: |
+          RESULT="${{ steps.cleanup.outputs.result }}"
+          echo "## EKS Cleanup Result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cluster | \`$CLUSTER_NAME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | \`$AWS_REGION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Result | **$RESULT** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exit Code | ${{ steps.cleanup.outputs.exit_code }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RESULT" = "DELETED" ]; then
+            echo "✅ **Cluster deleted. This workflow has been disabled.**" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$RESULT" = "NOT_FOUND" ]; then
+            echo "ℹ️ **Cluster not found. This workflow has been disabled.**" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$RESULT" = "IN_USE" ]; then
+            echo "⏳ **Cluster still in use. Will retry in 30 minutes.**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ **Unexpected error. Check logs.**" >> "$GITHUB_STEP_SUMMARY"
+          fi
