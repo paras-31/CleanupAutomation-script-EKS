@@ -402,20 +402,31 @@ def get_node_instance_ids(eks, ec2, cluster_name: str) -> list:
 #  AWS-API-ONLY CHECKS  (always work, no kubectl needed, 100% free)
 # ═════════════════════════════════════════════════════════════════
 def check_nodegroup_activity(eks, cluster_name: str) -> bool:
-    """Check if any nodegroup was created/updated within 1.5 hrs (free EKS API)."""
+    """Check if any nodegroup was CREATED within 1.5 hrs (free EKS API).
+
+    NOTE: We only check 'createdAt', NOT 'modifiedAt'.
+    AWS updates modifiedAt internally for health checks / status
+    reconciliation even when the user hasn't touched anything.
+    createdAt is the only reliable timestamp.
+    """
     cutoff = _cutoff()
     ng_names = eks.list_nodegroups(clusterName=cluster_name).get("nodegroups", [])
     for ng in ng_names:
         info = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=ng)
         ng_data = info.get("nodegroup", {})
-        modified = ng_data.get("modifiedAt") or ng_data.get("createdAt")
-        if modified and modified >= cutoff:
+        created = ng_data.get("createdAt")
+        if created and created >= cutoff:
             log.info(
-                "  Nodegroup '%s' modified/created at %s (within 1.5 hrs)",
-                ng, modified.isoformat(),
+                "  Nodegroup '%s' created at %s (within 1.5 hrs)",
+                ng, created.isoformat(),
             )
             return True
-    log.info("  No nodegroups modified in the last %d min.", IDLE_WINDOW_MINUTES)
+        else:
+            log.info(
+                "  Nodegroup '%s' created at %s (older than 1.5 hrs) ✓",
+                ng, created.isoformat() if created else "unknown",
+            )
+    log.info("  No nodegroups created in the last %d min.", IDLE_WINDOW_MINUTES)
     return False
 
 
