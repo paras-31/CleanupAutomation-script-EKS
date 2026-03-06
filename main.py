@@ -137,15 +137,15 @@ def _setup_kubeconfig(cluster_name: str, region: str) -> bool:
 # ═════════════════════════════════════════════════════════════════
 
 # ---- Check 1: Running user pods ----
-def check_user_pods() -> bool:
-    """Return True if any non-system pod is Running/Pending."""
+def check_user_pods() -> bool | None:
+    """Return True if active, False if idle, None if kubectl unavailable."""
     data = _run_kubectl(
         ["get", "pods", "--all-namespaces", "-o", "json"],
         "get pods",
     )
     if data is None:
-        log.warning("  Cannot list pods – treating as ACTIVE (fail-safe).")
-        return True
+        log.warning("  Cannot list pods via kubectl.")
+        return None  # signal kubectl failure
 
     pods = data.get("items", [])
     user_pods = [
@@ -168,14 +168,14 @@ def check_user_pods() -> bool:
 
 
 # ---- Check 2: Recent container starts (last 1.5 hrs) ----
-def check_recent_container_starts() -> bool:
-    """Return True if any container started within the idle window."""
+def check_recent_container_starts() -> bool | None:
+    """Return True if active, False if idle, None if kubectl unavailable."""
     data = _run_kubectl(
         ["get", "pods", "--all-namespaces", "-o", "json"],
         "get pods (container times)",
     )
     if data is None:
-        return True  # fail-safe
+        return None
 
     cutoff = _cutoff()
     for pod in data.get("items", []):
@@ -196,14 +196,14 @@ def check_recent_container_starts() -> bool:
 
 
 # ---- Check 3: Recent events (scheduling, pulls, starts) ----
-def check_recent_events() -> bool:
-    """Return True if there are recent scheduling/start events outside system NS."""
+def check_recent_events() -> bool | None:
+    """Return True if active, False if idle, None if kubectl unavailable."""
     data = _run_kubectl(
         ["get", "events", "--all-namespaces", "-o", "json"],
         "get events",
     )
     if data is None:
-        return True  # fail-safe
+        return None
 
     cutoff = _cutoff()
     active_reasons = {"Scheduled", "Started", "Pulling", "Pulled", "Created", "ScalingReplicaSet"}
@@ -273,14 +273,14 @@ def check_node_cpu_kubectl(cpu_threshold: float) -> bool:
 
 
 # ---- Check 5: User services (LoadBalancer / NodePort → likely in use) ----
-def check_user_services() -> bool:
-    """Return True if any non-system namespace has LoadBalancer or NodePort services."""
+def check_user_services() -> bool | None:
+    """Return True if active, False if idle, None if kubectl unavailable."""
     data = _run_kubectl(
         ["get", "services", "--all-namespaces", "-o", "json"],
         "get services",
     )
     if data is None:
-        return True  # fail-safe
+        return None
 
     user_svcs = [
         s for s in data.get("items", [])
@@ -302,14 +302,14 @@ def check_user_services() -> bool:
 
 
 # ---- Check 6: Recent deployments/rollouts (last 1.5 hrs) ----
-def check_recent_deployments() -> bool:
-    """Return True if any deployment was updated within the idle window."""
+def check_recent_deployments() -> bool | None:
+    """Return True if active, False if idle, None if kubectl unavailable."""
     data = _run_kubectl(
         ["get", "deployments", "--all-namespaces", "-o", "json"],
         "get deployments",
     )
     if data is None:
-        return True  # fail-safe
+        return None
 
     cutoff = _cutoff()
     for dep in data.get("items", []):
@@ -399,60 +399,166 @@ def get_node_instance_ids(eks, ec2, cluster_name: str) -> list:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  AWS-API-ONLY CHECKS  (always work, no kubectl needed, 100% free)
+# ═════════════════════════════════════════════════════════════════
+def check_nodegroup_activity(eks, cluster_name: str) -> bool:
+    """Check if any nodegroup was created/updated within 1.5 hrs (free EKS API)."""
+    cutoff = _cutoff()
+    ng_names = eks.list_nodegroups(clusterName=cluster_name).get("nodegroups", [])
+    for ng in ng_names:
+        info = eks.describe_nodegroup(clusterName=cluster_name, nodegroupName=ng)
+        ng_data = info.get("nodegroup", {})
+        modified = ng_data.get("modifiedAt") or ng_data.get("createdAt")
+        if modified and modified >= cutoff:
+            log.info(
+                "  Nodegroup '%s' modified/created at %s (within 1.5 hrs)",
+                ng, modified.isoformat(),
+            )
+            return True
+    log.info("  No nodegroups modified in the last %d min.", IDLE_WINDOW_MINUTES)
+    return False
+
+
+def check_elbs_in_cluster_vpc(clients: dict, vpc_id: str) -> bool:
+    """Check if there are any active ELBs in the VPC (indicates services in use)."""
+    if not vpc_id:
+        return False
+    # Check ALB/NLB
+    elb = clients["elb"]
+    paginator = elb.get_paginator("describe_load_balancers")
+    for page in paginator.paginate():
+        for lb in page["LoadBalancers"]:
+            if lb.get("VpcId") == vpc_id and lb.get("State", {}).get("Code") == "active":
+                log.info(
+                    "  Active load balancer found: %s (type=%s)",
+                    lb["LoadBalancerName"],
+                    lb.get("Type", "unknown"),
+                )
+                return True
+    # Check Classic ELB
+    classic = clients["elb_classic"]
+    try:
+        lbs = classic.describe_load_balancers()["LoadBalancerDescriptions"]
+        for lb in lbs:
+            if lb.get("VPCId") == vpc_id:
+                log.info("  Active Classic ELB found: %s", lb["LoadBalancerName"])
+                return True
+    except ClientError:
+        pass
+    log.info("  No active load balancers in VPC.")
+    return False
+
+
+def check_cluster_creation_time(eks, cluster_name: str) -> bool:
+    """Return True if the cluster was created within 1.5 hrs (too fresh to judge)."""
+    cutoff = _cutoff()
+    desc = eks.describe_cluster(name=cluster_name)
+    created = desc["cluster"].get("createdAt")
+    if created and created >= cutoff:
+        log.info(
+            "  Cluster created at %s (within 1.5 hrs – too new to judge idle)",
+            created.isoformat(),
+        )
+        return True
+    return False
+
+
+# ═════════════════════════════════════════════════════════════════
 #  MASTER IDLE CHECK
 # ═════════════════════════════════════════════════════════════════
 def is_cluster_idle(clients: dict, cluster_name: str, region: str, cpu_threshold: float) -> bool:
     """
-    Run ALL idle checks (100% free).  Return True only if the cluster is
-    confirmed idle for the last 1.5 hours.  Any failure → NOT idle (safe).
+    Run idle checks (100% free).  Return True only if cluster is confirmed idle
+    for the last 1.5 hours.
+
+    Strategy:
+      1. Try kubectl-based checks first (most accurate).
+      2. If kubectl is unavailable (common in CI/CD), fall back to
+         AWS-API-only checks which always work.
     """
     log.info("=" * 60)
     log.info("ACTIVITY CHECK  –  last %d minutes (1.5 hrs)", IDLE_WINDOW_MINUTES)
-    log.info("Cost: $0  (no CloudWatch – all checks use kubectl + free AWS APIs)")
+    log.info("Cost: $0  (no CloudWatch – kubectl + free AWS APIs)")
     log.info("=" * 60)
 
-    # Setup kubeconfig
-    if not _setup_kubeconfig(cluster_name, region):
-        log.warning("Cannot configure kubectl. Treating cluster as ACTIVE (fail-safe).")
-        return False
+    # ── Try kubectl ──
+    kubectl_available = _setup_kubeconfig(cluster_name, region)
+    kubectl_works = False
 
-    # Check 1: Running user pods
-    log.info("[1/7] Checking for running user workload pods …")
-    if check_user_pods():
-        log.warning("RESULT: Cluster has ACTIVE user workloads. Aborting cleanup.")
-        return False
+    if kubectl_available:
+        # Check 1: Running user pods
+        log.info("[1/7] Checking for running user workload pods …")
+        result = check_user_pods()
+        if result is True:
+            log.warning("RESULT: Cluster has ACTIVE user workloads. Aborting cleanup.")
+            return False
+        elif result is False:
+            kubectl_works = True  # kubectl is functional
+        # result is None → kubectl failed, will fall back
 
-    # Check 2: Recent container starts
-    log.info("[2/7] Checking for recently started containers (last 1.5 hrs) …")
-    if check_recent_container_starts():
-        log.warning("RESULT: Containers started recently. Cluster in USE. Aborting.")
-        return False
+        if kubectl_works:
+            # Check 2: Recent container starts
+            log.info("[2/7] Checking for recently started containers …")
+            result = check_recent_container_starts()
+            if result is True:
+                log.warning("RESULT: Containers started recently. Cluster in USE. Aborting.")
+                return False
 
-    # Check 3: Recent scheduling events
-    log.info("[3/7] Checking for recent scheduling/activity events …")
-    if check_recent_events():
-        log.warning("RESULT: Recent activity events detected. Aborting.")
-        return False
+            # Check 3: Recent scheduling events
+            log.info("[3/7] Checking for recent scheduling/activity events …")
+            result = check_recent_events()
+            if result is True:
+                log.warning("RESULT: Recent activity events detected. Aborting.")
+                return False
 
-    # Check 4: kubectl top nodes (CPU via metrics-server – free)
-    log.info("[4/7] Checking node CPU via 'kubectl top nodes' …")
-    if check_node_cpu_kubectl(cpu_threshold):
-        log.warning("RESULT: Node CPU above threshold. Cluster in USE. Aborting.")
-        return False
+            # Check 4: kubectl top nodes
+            log.info("[4/7] Checking node CPU via 'kubectl top nodes' …")
+            if check_node_cpu_kubectl(cpu_threshold):
+                log.warning("RESULT: Node CPU above threshold. Cluster in USE. Aborting.")
+                return False
 
-    # Check 5: User-facing services
-    log.info("[5/7] Checking for user LoadBalancer/NodePort services …")
-    if check_user_services():
-        log.warning("RESULT: User services found. Cluster likely in USE. Aborting.")
-        return False
+            # Check 5: User-facing services
+            log.info("[5/7] Checking for user LoadBalancer/NodePort services …")
+            result = check_user_services()
+            if result is True:
+                log.warning("RESULT: User services found. Cluster likely in USE. Aborting.")
+                return False
 
-    # Check 6: Recent deployment updates
-    log.info("[6/7] Checking for recently updated deployments …")
-    if check_recent_deployments():
-        log.warning("RESULT: Deployment updated recently. Cluster in USE. Aborting.")
-        return False
+            # Check 6: Recent deployment updates
+            log.info("[6/7] Checking for recently updated deployments …")
+            result = check_recent_deployments()
+            if result is True:
+                log.warning("RESULT: Deployment updated recently. Cluster in USE. Aborting.")
+                return False
 
-    # Check 7: Node launch times (free EC2 API)
+    # ── If kubectl failed, use AWS-API-only fallback ──
+    if not kubectl_works:
+        log.info("")
+        log.info("─" * 60)
+        log.info("kubectl unavailable – using AWS-API-only checks (all free)")
+        log.info("─" * 60)
+
+        # AWS Check A: Cluster creation time
+        log.info("[A] Checking cluster creation time …")
+        if check_cluster_creation_time(clients["eks"], cluster_name):
+            log.warning("RESULT: Cluster created very recently. Aborting.")
+            return False
+        log.info("  Cluster created more than 1.5 hrs ago. ✓")
+
+        # AWS Check B: Nodegroup modification times
+        log.info("[B] Checking nodegroup modification times …")
+        if check_nodegroup_activity(clients["eks"], cluster_name):
+            log.warning("RESULT: Nodegroup modified recently. Aborting.")
+            return False
+
+        # AWS Check C: Load balancers in the VPC
+        vpc_id = get_cluster_vpc_id(clients["eks"], cluster_name)
+        log.info("[C] Checking for active load balancers in VPC %s …", vpc_id)
+        if check_elbs_in_cluster_vpc(clients, vpc_id):
+            log.warning("RESULT: Active ELBs found → services likely running. Aborting.")
+            return False
+
+    # ── Check 7: Node launch times (always works – free EC2 API) ──
     log.info("[7/7] Checking node EC2 launch times …")
     instance_ids = get_node_instance_ids(clients["eks"], clients["ec2"], cluster_name)
     if instance_ids:
@@ -464,7 +570,7 @@ def is_cluster_idle(clients: dict, cluster_name: str, region: str, cpu_threshold
         log.info("  No node instances found (possibly Fargate-only).")
 
     log.info("=" * 60)
-    log.info("ALL 7 CHECKS PASSED – cluster is IDLE for the last 1.5 hrs")
+    log.info("ALL CHECKS PASSED – cluster is IDLE for the last 1.5 hrs")
     log.info("=" * 60)
     return True
 
@@ -938,7 +1044,7 @@ def main():
     )
     args = parser.parse_args()
 
-    log.info("EKS Cleanup Script (FREE – $0 cost) – %s", datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    log.info("EKS Cleanup Script (FREE – $0 cost) – %s", _now_utc().strftime("%Y-%m-%d %H:%M UTC"))
     log.info("Cluster : %s", args.cluster_name)
     log.info("Region  : %s", args.region)
     log.info("Dry-run : %s", args.dry_run)
