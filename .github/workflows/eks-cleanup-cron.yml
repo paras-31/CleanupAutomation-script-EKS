@@ -29,6 +29,7 @@ env:
   AWS_REGION: us-east-1
 
 permissions:
+  id-token: write                  # needed for OIDC auth with AWS
   contents: read
   actions: write                   # needed to update repo variable
 
