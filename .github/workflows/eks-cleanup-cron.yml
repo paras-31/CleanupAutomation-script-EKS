@@ -29,7 +29,6 @@ env:
   AWS_REGION: us-east-1
 
 permissions:
-  id-token: write                  # needed for OIDC auth with AWS
   contents: read
   actions: write                   # needed to update repo variable
 
@@ -76,7 +75,7 @@ jobs:
       #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       #     aws-region: ${{ env.AWS_REGION }}
 
-      - name: Configure AWS Credentials
+        - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::703671929703:role/Github-action-role
@@ -112,7 +111,7 @@ jobs:
         if: steps.cleanup.outputs.result == 'DELETED' || steps.cleanup.outputs.result == 'NOT_FOUND'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             const result = "${{ steps.cleanup.outputs.result }}";
             console.log(`Cleanup result: ${result}`);
