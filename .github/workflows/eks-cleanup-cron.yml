@@ -19,9 +19,7 @@
 
 name: EKS Cleanup
 
-on:
-  schedule:
-    - cron: "*/30 * * * *"        # every 30 minutes
+on:      # every 30 minutes
   workflow_dispatch:               # also allow manual trigger
 
 env:
@@ -29,6 +27,7 @@ env:
   AWS_REGION: us-east-1
 
 permissions:
+  id-token: write                  # needed for OIDC auth with AWS
   contents: read
   actions: write                   # needed to update repo variable
 
