@@ -34,10 +34,6 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-
-    # ── Gate: skip if cleanup already done ──
-    if: vars.CLEANUP_DONE != 'true'
-
     steps:
       - name: Log start
         run: |
